@@ -1,35 +1,37 @@
-import os, json, random, logging
+import os, json, random, logging, asyncio
 from pathlib import Path
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.dispatcher.filters import Text
 from dotenv import load_dotenv
+import sqlite3
 
-# ── ЛОГИ, чтобы видеть, что происходит ───────────────────
-logging.basicConfig(level=logging.INFO)
+# ── ЛОГИ ─────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 
-# ── НАДЁЖНАЯ загрузка .env из той же папки, что bot.py ───
+# ── BASE & ENV ───────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=BASE_DIR / ".env")
 
 TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_LINK = os.getenv("TELEGRAM_CHANNEL_LINK", "https://t.me/your_channel")
-OWNER_USERNAME = os.getenv("OWNER_USERNAME", "@your_username")
-USAGE_FILE = BASE_DIR / "usage.json"  # пишем рядом с bot.py
+OWNER_USERNAME = (os.getenv("OWNER_USERNAME", "@your_username") or "").strip()
+USAGE_FILE = BASE_DIR / "usage.json"   # замок на 7 дней
+DB_PATH = BASE_DIR / "subscribers.db"  # база рассылки
 
 if not TOKEN:
     raise RuntimeError("Нет токена. Откройте .env и пропишите BOT_TOKEN=...")
 
-# ── Инициализация бота: увеличим таймаут запросов ────────
-# (если сеть «тяжёлая», будет терпимее)
+# ── БОТ ──────────────────────────────────────────────────
 bot = Bot(token=TOKEN, parse_mode="HTML", timeout=120)
 dp = Dispatcher(bot)
 
-# ── ЕДИНЫЕ ТЕКСТЫ и дисклеймеры (18+) ────────────────────
+# ── ДИСКЛЕЙМЕРЫ и тексты ────────────────────────────────
 WELCOME = (
     "Привет! Это бот «Карта ясности» ✨\n\n"
-    "Нажми «Моя тема» → выбери один из тёрх вопросов → выбери карту и получи мягкую подсказку на сегодня. "
+    "Нажми «Моя тема» → выбери один из трёх вопросов → выбери карту и получи мягкую подсказку на сегодня. "
     "Одна карта доступна <b>раз в 7 дней</b>, чтобы сохранять трезвый взгляд и пользу.\n\n"
     "Важно: бот носит развлекательный и познавательный характер, не является медицинской или профессиональной консультацией. <b>18+</b>"
 )
@@ -84,7 +86,7 @@ TEXTS = {
         ),
         "2": (
             "<b>Ответ:</b> видит в тебе опору, но боится раскрыться. 💛\n"
-            "<b>Шаг:</b> скажи или напиши: «Мне тепло, когда мы общаемся чаще» и после предложи првести время вдвоём.»\n"
+            "<b>Шаг:</b> скажи или напиши: «Мне тепло, когда мы общаемся чаще» и после предложи провести время вдвоём.\n"
             "«Безопасность открывает двери мягче любых слов.»"
         ),
         "3": (
@@ -160,9 +162,9 @@ TEXTS = {
 }
 
 # ── Клавиатуры ───────────────────────────────────────────
-KB_MAIN = types.ReplyKeyboardMarkup(resize_keyboard=True)
-KB_MAIN.add("Моя тема")
-KB_MAIN.add("О консультации", "Канал")
+KB_MAIN = ReplyKeyboardMarkup(resize_keyboard=True)
+KB_MAIN.add(KeyboardButton("Моя тема"))
+KB_MAIN.add(KeyboardButton("О консультации"), KeyboardButton("Канал"))
 
 def topic_keyboard():
     kb = InlineKeyboardMarkup()
@@ -216,19 +218,151 @@ def mark_draw(user_id: int):
     data[str(user_id)] = datetime.utcnow().isoformat()
     save_usage(data)
 
+# ── БАЗА РАССЫЛКИ ────────────────────────────────────────
+def db_init():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS subscribers (
+              user_id INTEGER PRIMARY KEY,
+              username TEXT,
+              is_subscribed INTEGER DEFAULT 0,
+              created_at TEXT
+            )
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+def upsert_user(user: types.User, subscribe_flag: int = None):
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.execute("SELECT user_id FROM subscribers WHERE user_id=?", (user.id,))
+        row = cur.fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO subscribers (user_id, username, is_subscribed, created_at) VALUES (?, ?, ?, ?)",
+                (user.id, user.username, 1 if subscribe_flag else 0, datetime.utcnow().isoformat())
+            )
+        else:
+            if subscribe_flag is not None:
+                conn.execute(
+                    "UPDATE subscribers SET is_subscribed=?, username=? WHERE user_id=?",
+                    (1 if subscribe_flag else 0, user.username, user.id)
+                )
+            else:
+                conn.execute("UPDATE subscribers SET username=? WHERE user_id=?", (user.username, user.id))
+        conn.commit()
+    finally:
+        conn.close()
+
+def set_subscribe(user_id: int, value: bool):
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute("UPDATE subscribers SET is_subscribed=? WHERE user_id=?", (1 if value else 0, user_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+def get_all_subscribed_ids():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.execute("SELECT user_id FROM subscribers WHERE is_subscribed=1")
+        rows = [r[0] for r in cur.fetchall()]
+        return rows
+    finally:
+        conn.close()
+
+def is_owner(message: types.Message) -> bool:
+    if not message.from_user:
+        return False
+    uname = (message.from_user.username or "").strip()
+    return OWNER_USERNAME and uname and ("@" + uname).lower() == OWNER_USERNAME.lower()
+
+CONSENT_KB = InlineKeyboardMarkup().add(
+    InlineKeyboardButton("🔔 Получать редкие письма (до 2 в мес.)", callback_data="consent:yes"),
+    InlineKeyboardButton("🔕 Не сейчас", callback_data="consent:no")
+)
+
+# ── Шаблоны рассылок ─────────────────────────────────────
+TEMPLATES = [
+    ("update",
+     "✨ Обновление в «Карте Ясности»!\n\n"
+     "Добавлены новые варианты предсказаний — можешь попробовать уже сегодня.\n"
+     "Это короткие ответы + советы, которые помогут увидеть ситуацию по-новому.\n\n"
+     "Загляни в бота и открой свою карту заново 🔮"),
+
+    ("promo",
+     "🟡 <b>Реклама</b>\n\n"
+     "До [дата] действует акция — скидка 50% на первый разбор по любой теме:\n"
+     "🔮 Таро\n🔢 Нумерология\n🌌 Астрология\n\n"
+     "Чтобы воспользоваться, напиши мне в личку слово «ЯСНОСТЬ».\n"
+     "Поторопись: количество мест ограничено!\n\n"
+     "Отписка: /unsubscribe"),
+
+    ("remind",
+     "Привет 🌿\nКак твоя неделя?\n\n"
+     "Напоминаю: в «Карте Ясности» можно получить ответ на важный вопрос — раз в 7 дней.\n"
+     "Если чувствуешь, что нужна подсказка или знак — загляни в бота 🔮"),
+
+    ("tip",
+     "✨ Маленькая практика ясности:\n"
+     "Спроси себя — «Что я могу отпустить сегодня, чтобы стало легче?»\n\n"
+     "Ответы обычно приходят сразу, главное — довериться первому ощущению.\n\n"
+     "А если хочется подтверждения или направления — открой «Карту Ясности» 🔮"),
+
+    ("motivation",
+     "Иногда достаточно одного верного шага, чтобы изменить весь маршрут 🌌\n\n"
+     "Пусть эта неделя принесёт тебе ясность и уверенность в себе.\n"
+     "Если захочешь подсказку от «Карты Ясности» — она ждёт тебя 🔮"),
+]
+
 # ─────────────────────────────────────────────────────────
-# Хендлеры
+# ХЕНДЛЕРЫ
 # ─────────────────────────────────────────────────────────
+
 @dp.message_handler(commands=["start"])
 async def cmd_start(m: types.Message):
-    photo_path = "welcome.jpg"  # картинка рядом с bot.py
+    db_init()
+    upsert_user(m.from_user, subscribe_flag=0)  # фиксируем пользователя, без авто-подписки
+
+    photo_path = BASE_DIR / "welcome.jpg"
     try:
         with open(photo_path, "rb") as photo:
             await m.answer_photo(photo, caption=WELCOME, reply_markup=KB_MAIN)
     except FileNotFoundError:
-        # если файла нет — просто текст
         await m.answer(WELCOME, reply_markup=KB_MAIN)
 
+    await m.answer(
+        "Можно иногда присылать короткие тёплые письма (до 2 в месяц): обновления карт, мини-практики, акции?\n"
+        "Ты всегда сможешь отписаться командой /unsubscribe.",
+        reply_markup=CONSENT_KB
+    )
+
+@dp.callback_query_handler(Text(startswith="consent:"))
+async def on_consent(c: types.CallbackQuery):
+    choice = c.data.split(":")[1]
+    if choice == "yes":
+        set_subscribe(c.from_user.id, True)
+        await c.message.edit_text("Подписка включена. Я пишу редко и по делу 💌\nОтписка: /unsubscribe.")
+    else:
+        set_subscribe(c.from_user.id, False)
+        await c.message.edit_text("Хорошо, без рассылок. Если захочешь — команда /subscribe.")
+    await c.answer()
+
+@dp.message_handler(commands=["subscribe"])
+async def cmd_subscribe(m: types.Message):
+    db_init()
+    upsert_user(m.from_user)
+    set_subscribe(m.from_user.id, True)
+    await m.answer("🔔 Подписка включена. Сообщения — не чаще 1–2 раз в месяц.\nОтписка: /unsubscribe.")
+
+@dp.message_handler(commands=["unsubscribe", "stop"])
+async def cmd_unsubscribe(m: types.Message):
+    db_init()
+    upsert_user(m.from_user)
+    set_subscribe(m.from_user.id, False)
+    await m.answer("🔕 Подписка отключена. Спасибо, что была(и) со мной. Вернуться можно командой /subscribe.")
 
 @dp.message_handler(commands=["help"])
 async def cmd_help(m: types.Message):
@@ -290,11 +424,77 @@ async def on_card(c: types.CallbackQuery):
     await c.answer()
     await c.message.edit_text(reply, disable_web_page_preview=True)
 
+# ── Рассылка: команды владельца ──────────────────────────
+@dp.message_handler(commands=["templates"])
+async def cmd_templates(m: types.Message):
+    if not is_owner(m):
+        return await m.answer("Команда доступна только владельцу.")
+    lines = ["Доступные шаблоны:"]
+    for i, (code, _) in enumerate(TEMPLATES, start=1):
+        lines.append(f"{i}. {code}")
+    lines.append("\nОтправь: /send N — чтобы разослать шаблон номер N.")
+    await m.answer("\n".join(lines))
+
+@dp.message_handler(commands=["send"])
+async def cmd_send(m: types.Message):
+    if not is_owner(m):
+        return await m.answer("Команда доступна только владельцу.")
+    parts = m.text.strip().split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return await m.answer("Формат: /send N (номер шаблона из /templates)")
+    idx = int(parts[1]) - 1
+    if not (0 <= idx < len(TEMPLATES)):
+        return await m.answer("Нет такого номера шаблона.")
+    text = TEMPLATES[idx][1]
+    db_init()
+    user_ids = get_all_subscribed_ids()
+    if not user_ids:
+        return await m.answer("Нет подписчиков. Никому отправлять.")
+    await m.answer(f"Начинаю рассылку шаблона #{idx+1}. Получателей: {len(user_ids)}")
+    sent, errors = 0, 0
+    for uid in user_ids:
+        try:
+            await bot.send_message(uid, text, disable_web_page_preview=True)
+            sent += 1
+        except Exception as e:
+            logging.warning(f"send template to {uid} failed: {e}")
+            errors += 1
+        await asyncio.sleep(0.05)  # ~20/сек
+    await m.answer(f"Готово ✅ Успешно: {sent} | Ошибок: {errors}")
+
+@dp.message_handler(commands=["broadcast"])
+async def cmd_broadcast(m: types.Message):
+    if not is_owner(m):
+        return await m.answer("Команда доступна только владельцу.")
+    parts = m.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        return await m.answer("Формат: /broadcast ТЕКСТ\n"
+                              "Письмо отправится только тем, кто включил подписку (/subscribe).")
+    text = parts[1].strip()
+    if any(w in text.lower() for w in ["скидк", "промокод", "акция"]):
+        text = "🟡 <b>Реклама</b>\n" + text + "\n\nОтписка: /unsubscribe"
+    db_init()
+    user_ids = get_all_subscribed_ids()
+    if not user_ids:
+        return await m.answer("Нет подписчиков. Никому отправлять.")
+    await m.answer(f"Начинаю рассылку. Получателей: {len(user_ids)}")
+    sent, errors = 0, 0
+    for uid in user_ids:
+        try:
+            await bot.send_message(uid, text, disable_web_page_preview=True)
+            sent += 1
+        except Exception as e:
+            logging.warning(f"broadcast to {uid} failed: {e}")
+            errors += 1
+        await asyncio.sleep(0.05)
+    await m.answer(f"Готово ✅ Успешно: {sent} | Ошибок: {errors}")
+
 # Фолбэк: если пользователь пишет что-то другое — показываем меню
 @dp.message_handler(content_types=types.ContentTypes.TEXT)
 async def fallback(m: types.Message):
-    await m.answer("Чтобы продолжить, нажми «моя тема» или команду /menu 🙂", reply_markup=KB_MAIN)
+    await m.answer("Чтобы продолжить, нажми «Моя тема» или команду /menu 🙂", reply_markup=KB_MAIN)
 
 # ── Запуск ───────────────────────────────────────────────
 if __name__ == "__main__":
+    db_init()
     executor.start_polling(dp, skip_updates=True)
