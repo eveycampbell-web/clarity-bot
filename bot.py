@@ -296,11 +296,31 @@ DECKS: dict[str, dict[str, str]] = {
     },
 }
 
-def build_card_text(topic: str) -> str:
-    t = topic if topic in DECKS else "think"
-    variant_key = random.choice(list(DECKS[t].keys()))
-    base = DECKS[t][variant_key]
-    return base + CTA_TAIL
+# ── Клавиатуры ───────────────────────────────────────────
+KB_MAIN = ReplyKeyboardMarkup(resize_keyboard=True)
+KB_MAIN.add(KeyboardButton("Моя тема"))
+KB_MAIN.add(KeyboardButton("О консультации"), KeyboardButton("Канал"))
+
+def topic_keyboard():
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton(TOPIC_LABELS["think"], callback_data="topic:think"))
+    kb.add(InlineKeyboardButton(TOPIC_LABELS["money"], callback_data="topic:money"))
+    kb.add(InlineKeyboardButton(TOPIC_LABELS["talent"], callback_data="topic:talent"))
+    return kb
+
+def card_keyboard(topic_code: str):
+    kb = InlineKeyboardMarkup(row_width=3)
+    kb.add(
+        InlineKeyboardButton("1", callback_data=f"card:{topic_code}:1"),
+        InlineKeyboardButton("2", callback_data=f"card:{topic_code}:2"),
+        InlineKeyboardButton("3", callback_data=f"card:{topic_code}:3"),
+    )
+    kb.add(
+        InlineKeyboardButton("4", callback_data=f"card:{topic_code}:4"),
+        InlineKeyboardButton("5", callback_data=f"card:{topic_code}:5"),
+        InlineKeyboardButton("🎲 Случайно", callback_data=f"card:{topic_code}:rnd"),
+    )
+    return kb
 
 # ---------- ХЭНДЛЕРЫ ----------
 @dp.message_handler(commands=['start'])
@@ -405,3 +425,4 @@ async def cmd_stats(m: types.Message):
 if __name__ == "__main__":
     db_init()
     executor.start_polling(dp, skip_updates=True)
+
