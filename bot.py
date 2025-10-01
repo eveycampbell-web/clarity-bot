@@ -233,6 +233,12 @@ def _load_usage() -> dict:
     except Exception:
         return {}
 
+def _save_usage(data: dict):
+    # Чиним полностью битый usage.json (если кто-то записал не-словарь)
+    if not isinstance(data, dict):
+        data = {}
+    USAGE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+
 def can_draw_card(user_id: int) -> tuple[bool, str | None]:
     """
     Возвращает (можно_ли, когда_можно_снова).
@@ -508,6 +514,7 @@ async def cmd_stats(m: types.Message):
 if __name__ == "__main__":
     db_init()
     executor.start_polling(dp, skip_updates=True)
+
 
 
 
