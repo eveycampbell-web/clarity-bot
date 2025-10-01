@@ -113,6 +113,20 @@ TOPICS_KB.add(
     InlineKeyboardButton("Мой скрытый талант", callback_data="t:talent"),
 )
 
+# --- Клавиатура выбора карты 1–5 + 🎲 ---
+def build_cards_kb(topic: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=3)
+    kb.add(
+        InlineKeyboardButton("1", callback_data=f"c:{topic}:1"),
+        InlineKeyboardButton("2", callback_data=f"c:{topic}:2"),
+        InlineKeyboardButton("3", callback_data=f"c:{topic}:3"),
+        InlineKeyboardButton("4", callback_data=f"c:{topic}:4"),
+        InlineKeyboardButton("5", callback_data=f"c:{topic}:5"),
+    )
+    kb.add(InlineKeyboardButton("🎲 Случайная", callback_data=f"c:{topic}:rand"))
+    kb.add(InlineKeyboardButton("⬅️ Назад к темам", callback_data="t:menu"))
+    return kb
+
 BACK_TO_MENU_KB = InlineKeyboardMarkup().add(
     InlineKeyboardButton("Назад к темам", callback_data="t:menu")
 )
@@ -401,32 +415,51 @@ async def choose_topic(m: types.Message):
     # одно сообщение, сразу с инлайн-кнопками тем
     await m.answer("Выбирай тему:", reply_markup=TOPICS_KB)
 
-@dp.callback_query_handler(Text(startswith="t:"))
+# показываем выбор карт для выбранной темы (1–5 или 🎲)
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("t:"))
 async def topic_router(c: types.CallbackQuery):
-    code = c.data.split(":", 1)[1]
+    code = c.data.split(":", 1)[1]  # think | money | talent | menu
     if code == "menu":
         await c.message.edit_text("Выбирай тему:", reply_markup=TOPICS_KB)
         await c.answer()
         return
 
-    ok, when = can_draw_card(c.from_user.id)
-    if not ok:
-        msg = (
-            f"Карту ясности можно получать 1 раз в {LOCK_DAYS} дней.\n"
-            f"Новая карта будет доступна: <b>{when}</b>\n\n"
-            f"{LOCK_TEXT}"
-        )
-        await c.answer()
-        await c.message.answer(msg, reply_markup=BACK_TO_MENU_KB)
+    # сразу даём выбор карт
+    await c.message.edit_text("Выбери карту:", reply_markup=build_cards_kb(code))
+    await c.answer()
+
+# обработчик клика по конкретной карте 1–5 или 🎲
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("c:"))
+async def card_choice(c: types.CallbackQuery):
+    try:
+        _, topic, key = c.data.split(":")  # topic in (think|money|talent), key in (1..5|rand)
+    except ValueError:
+        await c.answer("Что-то пошло не так.", show_alert=True)
         return
 
-    text = build_card_text(code)
+    # замок 7 дней
+    ok, when = can_draw_card(c.from_user.id)
+    if not ok:
+        await c.answer()
+        await c.message.answer(LOCK_TEXT, reply_markup=BACK_TO_MENU_KB)
+        return
+
+    # выбираем карту: конкретную 1..5 или случайную из имеющихся ключей
+    if key == "rand":
+        key = random.choice(list(DECKS.get(topic, {}).keys()))
+
+    text = DECKS.get(topic, {}).get(key)
+    if not text:
+        await c.answer("Карты не нашлось 🙈", show_alert=True)
+        return
+
+    # логика после выдачи карты
     mark_card_drawn(c.from_user.id)
     upsert_user(c.from_user)  # обновить last_seen
-    log_event(c.from_user.id, "card", code)
+    log_event(c.from_user.id, "card", f"{topic}:{key}")
 
     await c.answer()
-    await c.message.answer(text, reply_markup=BACK_TO_MENU_KB)
+    await c.message.answer(text + CTA_TAIL, reply_markup=BACK_TO_MENU_KB)
 
 # ---------- /stats (краткая админ-статистика) ----------
 @dp.message_handler(commands=['stats'])
@@ -455,4 +488,5 @@ async def cmd_stats(m: types.Message):
 if __name__ == "__main__":
     db_init()
     executor.start_polling(dp, skip_updates=True)
+
 
