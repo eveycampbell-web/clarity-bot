@@ -233,24 +233,44 @@ def _load_usage() -> dict:
     except Exception:
         return {}
 
-def _save_usage(data: dict):
-    USAGE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
-
 def can_draw_card(user_id: int) -> tuple[bool, str | None]:
+    """
+    Возвращает (можно_ли, когда_можно_снова).
+    Поддерживает старый формат usage.json (строка) и мигрирует его в новый.
+    """
     data = _load_usage()
-    rec = data.get(str(user_id))
+    uid = str(user_id)
+    rec = data.get(uid)
     if not rec:
         return True, None
-    last_ts = datetime.fromisoformat(rec["last_draw"])
+
+    # старый формат: rec == "2025-10-01T04:20:33"
+    if isinstance(rec, str):
+        try:
+            last_ts = datetime.fromisoformat(rec)
+        except Exception:
+            return True, None
+        # мигрируем в новый формат
+        data[uid] = {"last_draw": rec}
+        _save_usage(data)
+    else:
+        # новый формат: {"last_draw": "..."}
+        try:
+            last_ts = datetime.fromisoformat(rec.get("last_draw", ""))
+        except Exception:
+            return True, None
+
     if datetime.now() - last_ts >= timedelta(days=LOCK_DAYS):
         return True, None
     next_time = last_ts + timedelta(days=LOCK_DAYS)
     return False, next_time.strftime("%d.%m %H:%M")
 
+
 def mark_card_drawn(user_id: int):
     data = _load_usage()
     data[str(user_id)] = {"last_draw": datetime.now().isoformat(timespec="seconds")}
     _save_usage(data)
+
 
 # ---------- КОНТЕНТ КАРТ (твои тексты) ----------
 DECKS: dict[str, dict[str, str]] = {
@@ -488,5 +508,6 @@ async def cmd_stats(m: types.Message):
 if __name__ == "__main__":
     db_init()
     executor.start_polling(dp, skip_updates=True)
+
 
 
