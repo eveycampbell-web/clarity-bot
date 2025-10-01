@@ -5,13 +5,18 @@ Clarity Bot — стабильная версия с твоими текстам
 - Python 3.11
 
 Функции:
-  • /start с приветствием и фото + постоянные кнопки «Моя тема», «О консультации», «Канал»
+  • /start с приветствием и фото + КНОПКИ (reply): «Моя тема», «О консультации», «Канал»
   • приглашение подписаться показывается ТОЛЬКО ОДИН РАЗ (consent_shown)
   • /subscribe и /unsubscribe
-  • «Моя тема» → 3 темы → ВЫБОР СЛУЧАЙНО из 5 карт (ровно 5)
-  • «замок» на 7 дней (usage.json) + красивое сообщение и время следующей карты
+  • «Моя тема» → 3 темы → 6 вариантов: 5 твоих + 6-я «случайная из этих 5»
+  • «замок» на 7 дней на получение карты (usage.json)
   • логирование событий в SQLite (users/events)
-  • авто-починка недостающих колонок в users (subscribe_flag, consent_shown)
+  • авто-починка недостающих колонок (subscribe_flag, consent_shown) в users
+
+Переменные окружения в .env:
+  BOT_TOKEN=...
+  TELEGRAM_CHANNEL_LINK=https://t.me/annap_club
+  OWNER_USERNAME=@AnnaPClub
 """
 
 import os
@@ -21,7 +26,6 @@ import logging
 import time
 from pathlib import Path
 from datetime import datetime, timedelta
-import sqlite3
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
@@ -31,9 +35,13 @@ from aiogram.types import (
 )
 from aiogram.dispatcher.filters import Text
 from dotenv import load_dotenv
+import sqlite3
 
 # ---------- ЛОГИ ----------
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s:%(name)s:%(message)s"
+)
 
 # ---------- BASE & ENV ----------
 BASE_DIR = Path(__file__).resolve().parent
@@ -87,29 +95,34 @@ ABOUT_TEXT = (
     f"💬 Напиши «ЯСНОСТЬ» {OWNER_USERNAME} — подскажу формат и время. <b>18+</b>"
 )
 
-# ---------- КНОПКИ ----------
-# Согласие на рассылку (показываем один раз, поверх основного меню)
+# ---------- КЛАВИАТУРЫ ----------
+# Согласие/отказ (показываем ОДИН РАЗ)
 CONSENT_KB = ReplyKeyboardMarkup(resize_keyboard=True)
 CONSENT_KB.add(KeyboardButton("Подписаться ❤️"), KeyboardButton("🚫 Не сейчас"))
 
-# Постоянное нижнее меню (ReplyKeyboard) — всегда видно
+# ГЛАВНАЯ reply-клавиатура (всегда внизу)
 KB_MAIN = ReplyKeyboardMarkup(resize_keyboard=True)
 KB_MAIN.row(KeyboardButton("Моя тема"))
 KB_MAIN.row(KeyboardButton("О консультации"), KeyboardButton("Канал"))
 
-# Темы (Inline под сообщением)
+# Inline-кнопки с темами
 TOPICS_KB = InlineKeyboardMarkup(row_width=1)
 TOPICS_KB.add(
     InlineKeyboardButton("Что он(а) думает обо мне?", callback_data="t:think"),
     InlineKeyboardButton("Как зарабатывать больше?", callback_data="t:money"),
     InlineKeyboardButton("Мой скрытый талант", callback_data="t:talent"),
 )
-BACK_TO_MENU_KB = InlineKeyboardMarkup().add(InlineKeyboardButton("Назад к темам", callback_data="t:menu"))
+
+BACK_TO_MENU_KB = InlineKeyboardMarkup().add(
+    InlineKeyboardButton("Назад к темам", callback_data="t:menu")
+)
 
 # ---------- SQLite: схема и авто-починка ----------
 def db_init():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
+
+    # Базовые таблицы
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id        INTEGER PRIMARY KEY,
@@ -129,6 +142,7 @@ def db_init():
             meta        TEXT
         )
     """)
+
     # Добавляем недостающие колонки, если база старая
     cur.execute("PRAGMA table_info(users)")
     cols = {row[1] for row in cur.fetchall()}
@@ -136,42 +150,55 @@ def db_init():
         cur.execute("ALTER TABLE users ADD COLUMN subscribe_flag INTEGER DEFAULT 0")
     if "consent_shown" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN consent_shown INTEGER DEFAULT 0")
+
     conn.commit()
     conn.close()
 
 def log_event(user_id: int, event_type: str, meta: str | None = None):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("INSERT INTO events (user_id, event_type, ts, meta) VALUES (?,?,?,?)",
-                (user_id, event_type, int(time.time()), meta))
+    cur.execute(
+        "INSERT INTO events (user_id, event_type, ts, meta) VALUES (?,?,?,?)",
+        (user_id, event_type, int(time.time()), meta)
+    )
     conn.commit()
     conn.close()
 
 def upsert_user(u: types.User, subscribe_flag: int | None = None, consent_shown: int | None = None):
+    """Вставляет или обновляет пользователя + last_seen_ts."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT user_id FROM users WHERE user_id=?", (u.id,))
     row = cur.fetchone()
     now = int(time.time())
+
     if row:
-        sets, args = ["last_seen_ts=?"], [now]
+        sets = ["last_seen_ts=?"]
+        args = [now]
         if subscribe_flag is not None:
-            sets.append("subscribe_flag=?"); args.append(int(subscribe_flag))
+            sets.append("subscribe_flag=?")
+            args.append(int(subscribe_flag))
         if consent_shown is not None:
-            sets.append("consent_shown=?"); args.append(int(consent_shown))
+            sets.append("consent_shown=?")
+            args.append(int(consent_shown))
+        sets_str = ", ".join(sets)
         args.append(u.id)
-        cur.execute(f"UPDATE users SET {', '.join(sets)} WHERE user_id=?", args)
+        cur.execute(f"UPDATE users SET {sets_str} WHERE user_id=?", args)
     else:
         cur.execute("""
             INSERT INTO users (user_id, username, first_name, last_name,
                                first_seen_ts, last_seen_ts, subscribe_flag, consent_shown)
-            VALUES (?,?,?,?,?,?,?,?)
-        """, (u.id, u.username, u.first_name, u.last_name, now, now,
-              int(subscribe_flag or 0), int(consent_shown or 0)))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            u.id, u.username, u.first_name, u.last_name,
+            now, now,
+            int(subscribe_flag or 0), int(consent_shown or 0)
+        ))
     conn.commit()
     conn.close()
 
 def get_user_flags(user_id: int) -> tuple[int, int]:
+    """Возвращает (subscribe_flag, consent_shown). Если пользователя ещё нет — (0,0)."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT subscribe_flag, consent_shown FROM users WHERE user_id=?", (user_id,))
@@ -211,7 +238,7 @@ def mark_card_drawn(user_id: int):
     data[str(user_id)] = {"last_draw": datetime.now().isoformat(timespec="seconds")}
     _save_usage(data)
 
-# ---------- КОНТЕНТ КАРТ (твои тексты, 5/тема) ----------
+# ---------- КОНТЕНТ КАРТ (твои тексты) ----------
 DECKS: dict[str, dict[str, str]] = {
     "think": {
         "1": (
@@ -296,31 +323,22 @@ DECKS: dict[str, dict[str, str]] = {
     },
 }
 
-# ── Клавиатуры ───────────────────────────────────────────
-KB_MAIN = ReplyKeyboardMarkup(resize_keyboard=True)
-KB_MAIN.add(KeyboardButton("Моя тема"))
-KB_MAIN.add(KeyboardButton("О консультации"), KeyboardButton("Канал"))
+def build_card_text(topic: str) -> str:
+    """
+    Возвращает ОДНУ карту.
+    6 вариантов = 5 фиксированных твоих текстов + 1 «случайная из этих же 5».
+    Никаких чужих формулировок — только твои.
+    """
+    t = topic if topic in DECKS else "think"
+    base_texts = list(DECKS[t].values())  # ровно 5
 
-def topic_keyboard():
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton(TOPIC_LABELS["think"], callback_data="topic:think"))
-    kb.add(InlineKeyboardButton(TOPIC_LABELS["money"], callback_data="topic:money"))
-    kb.add(InlineKeyboardButton(TOPIC_LABELS["talent"], callback_data="topic:talent"))
-    return kb
+    idx = random.randrange(6)
+    if idx == 5:
+        chosen = random.choice(base_texts)   # «шестая» — случайная из этих же 5
+    else:
+        chosen = base_texts[idx]             # одна из пяти фиксированных
 
-def card_keyboard(topic_code: str):
-    kb = InlineKeyboardMarkup(row_width=3)
-    kb.add(
-        InlineKeyboardButton("1", callback_data=f"card:{topic_code}:1"),
-        InlineKeyboardButton("2", callback_data=f"card:{topic_code}:2"),
-        InlineKeyboardButton("3", callback_data=f"card:{topic_code}:3"),
-    )
-    kb.add(
-        InlineKeyboardButton("4", callback_data=f"card:{topic_code}:4"),
-        InlineKeyboardButton("5", callback_data=f"card:{topic_code}:5"),
-        InlineKeyboardButton("🎲 Случайно", callback_data=f"card:{topic_code}:rnd"),
-    )
-    return kb
+    return chosen + CTA_TAIL
 
 # ---------- ХЭНДЛЕРЫ ----------
 @dp.message_handler(commands=['start'])
@@ -329,7 +347,7 @@ async def cmd_start(m: types.Message):
     upsert_user(m.from_user, subscribe_flag=0)
     log_event(m.from_user.id, "start")
 
-    # привет + фото + постоянное меню
+    # привет + фото
     photo_path = BASE_DIR / "welcome.jpg"
     try:
         with open(photo_path, "rb") as photo:
@@ -337,8 +355,8 @@ async def cmd_start(m: types.Message):
     except FileNotFoundError:
         await m.answer(WELCOME, reply_markup=KB_MAIN)
 
-    # приглашение к рассылке — только один раз
-    _, consent_shown = get_user_flags(m.from_user.id)
+    # ПРИГЛАШЕНИЕ К РАССЫЛКЕ — ТОЛЬКО ОДИН РАЗ
+    sub_flag, consent_shown = get_user_flags(m.from_user.id)
     if consent_shown == 0:
         upsert_user(m.from_user, consent_shown=1)
         await m.answer(CONSENT_TEXT, reply_markup=CONSENT_KB)
@@ -366,46 +384,52 @@ async def manual_unsubscribe(m: types.Message):
     log_event(m.from_user.id, "unsubscribe", "manual")
     await m.answer("Подписка выключена. В любой момент можно включить: /subscribe")
 
-# Постоянные кнопки нижнего меню
 @dp.message_handler(Text(equals="О консультации"))
-async def on_about(m: types.Message):
-    log_event(m.from_user.id, "about_click")
-    await m.answer(ABOUT_TEXT)
+async def about_handler(m: types.Message):
+    kb = InlineKeyboardMarkup().add(
+        InlineKeyboardButton("Написать", url=f"https://t.me/{OWNER_USERNAME[1:]}")) if OWNER_USERNAME.startswith("@") \
+        else InlineKeyboardMarkup()
+    await m.answer(ABOUT_TEXT, reply_markup=kb if kb.inline_keyboard else None)
 
 @dp.message_handler(Text(equals="Канал"))
-async def on_channel(m: types.Message):
-    log_event(m.from_user.id, "channel_click")
-    await m.answer(f"Мой канал: {CHANNEL_LINK}")
+async def channel_handler(m: types.Message):
+    kb = InlineKeyboardMarkup().add(InlineKeyboardButton("Открыть канал", url=CHANNEL_LINK))
+    await m.answer("Вот ссылка на мой канал. Жду тебя 💚\n\n<b>18+</b>", reply_markup=kb)
 
 @dp.message_handler(Text(equals="Моя тема"))
 async def choose_topic(m: types.Message):
-    # Одно сообщение сразу с темами (без лишних фраз)
-    await m.answer("Выбери тему:", reply_markup=TOPICS_KB)
+    # сразу показываем темы (без лишних фраз)
+    await m.answer(" ", reply_markup=types.ReplyKeyboardRemove())
+    await m.answer("Выбирай тему:", reply_markup=TOPICS_KB)
 
 @dp.callback_query_handler(Text(startswith="t:"))
 async def topic_router(c: types.CallbackQuery):
     code = c.data.split(":", 1)[1]
     if code == "menu":
-        await c.message.edit_text("Выбери тему:", reply_markup=TOPICS_KB)
+        await c.message.edit_text("Выбирай тему:", reply_markup=TOPICS_KB)
         await c.answer()
         return
 
     ok, when = can_draw_card(c.from_user.id)
     if not ok:
-        msg = LOCK_TEXT + f"\n\nНовая карта будет доступна: <b>{when}</b>"
+        msg = (
+            f"Карту ясности можно получать 1 раз в {LOCK_DAYS} дней.\n"
+            f"Новая карта будет доступна: <b>{when}</b>\n\n"
+            f"{LOCK_TEXT}"
+        )
         await c.answer()
         await c.message.answer(msg, reply_markup=BACK_TO_MENU_KB)
         return
 
     text = build_card_text(code)
     mark_card_drawn(c.from_user.id)
-    upsert_user(c.from_user)
+    upsert_user(c.from_user)  # обновить last_seen
     log_event(c.from_user.id, "card", code)
 
     await c.answer()
     await c.message.answer(text, reply_markup=BACK_TO_MENU_KB)
 
-# ---------- /stats ----------
+# ---------- /stats (краткая админ-статистика) ----------
 @dp.message_handler(commands=['stats'])
 async def cmd_stats(m: types.Message):
     if OWNER_USERNAME and f"@{(m.from_user.username or '').lower()}" != OWNER_USERNAME.lower():
@@ -413,16 +437,22 @@ async def cmd_stats(m: types.Message):
         return
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM users"); total = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM users WHERE subscribe_flag=1"); subs = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM users")
+    total = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM users WHERE subscribe_flag=1")
+    subs = cur.fetchone()[0]
     week_ago = int((datetime.now() - timedelta(days=7)).timestamp())
     cur.execute("SELECT COUNT(DISTINCT user_id) FROM events WHERE ts>=?", (week_ago,))
     active7 = cur.fetchone()[0]
     conn.close()
-    await m.answer(f"Пользователи: {total}\nПодписка включена: {subs}\nАктив за 7 дней: {active7}")
+    text = (
+        f"Пользователи: {total}\n"
+        f"Подписка включена: {subs}\n"
+        f"Актив за 7 дней: {active7}"
+    )
+    await m.answer(text)
 
-# ---------- ENTRY ----------
+# ---------- ТОЧКА ВХОДА ----------
 if __name__ == "__main__":
     db_init()
     executor.start_polling(dp, skip_updates=True)
-
