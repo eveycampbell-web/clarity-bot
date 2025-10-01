@@ -396,10 +396,9 @@ async def channel_handler(m: types.Message):
     kb = InlineKeyboardMarkup().add(InlineKeyboardButton("Открыть канал", url=CHANNEL_LINK))
     await m.answer("Вот ссылка на мой канал. Жду тебя 💚\n\n<b>18+</b>", reply_markup=kb)
 
-@dp.message_handler(Text(equals="Моя тема"))
+@dp.message_handler(Text(equals="Моя тема", ignore_case=True))
 async def choose_topic(m: types.Message):
-    # сразу показываем темы (без лишних фраз)
-    await m.answer(" ", reply_markup=types.ReplyKeyboardRemove())
+    # одно сообщение, сразу с инлайн-кнопками тем
     await m.answer("Выбирай тему:", reply_markup=TOPICS_KB)
 
 @dp.callback_query_handler(Text(startswith="t:"))
@@ -456,3 +455,4 @@ async def cmd_stats(m: types.Message):
 if __name__ == "__main__":
     db_init()
     executor.start_polling(dp, skip_updates=True)
+
